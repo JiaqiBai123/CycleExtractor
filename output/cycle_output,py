@@ -1,0 +1,205 @@
+"""Writing an amplicon's decomposition as ``*_cycles.txt``.
+ 
+The format is AmpliconArchitect's, which CE and CoRAL both emit::
+ 
+    Interval	1	chr7	54659673	56149664
+    List of cycle segments
+    Segment	1	chr7	54659673	54763281
+    ...
+    List of longest subpath constraints
+    Path constraint	1	e2+:1,c2-:1,e3+:1	Support=6	Unsatisfied
+    List of extracted cycles/paths
+    Cycle=1;Copy_count=85.18;Segments=6+,2+,4+;Path_constraints_satisfied=
+ 
+Everything is 1-based here and 0-based inside CE, so indices are shifted on the
+way out and nowhere else.
+ 
+Cycles are reported before paths and each group is ordered by decreasing copy
+number, so the heaviest structure is the first thing a reader sees. A cycle's
+starting point is arbitrary -- any rotation names the same structure -- so no
+attempt is made to match another tool's choice of where to begin.
+"""
+ 
+from __future__ import annotations
+ 
+import logging
+import pathlib
+from collections.abc import Iterable
+ 
+from cycle_extractor.datatypes import (
+    BreakpointGraph,
+    CycleSolution,
+    EdgeType,
+    OptimizationWalk,
+    Strand,
+)
+from cycle_extractor.output import traversal
+ 
+logger = logging.getLogger(__name__)
+ 
+SEPARATOR = "\t"
+ 
+ 
+def write_cycles(
+    solution: CycleSolution,
+    graph: BreakpointGraph,
+    path: str | pathlib.Path,
+) -> None:
+    """Write ``solution`` to ``path`` in the cycles-file format."""
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as handle:
+        for line in render_cycles(solution, graph):
+            handle.write(line + "\n")
+    logger.info(
+        "Wrote %d cycle(s) and %d path(s) to %s.",
+        solution.num_cycles,
+        solution.num_paths,
+        path,
+    )
+ 
+ 
+def render_cycles(
+    solution: CycleSolution, graph: BreakpointGraph
+) -> Iterable[str]:
+    """Produce the file's lines, so a caller can stream or capture them."""
+    yield from _render_intervals(graph)
+    yield "List of cycle segments"
+    yield from _render_segments(graph)
+    yield "List of longest subpath constraints"
+    yield from _render_constraints(solution, graph)
+    yield "List of extracted cycles/paths"
+    yield from _render_walks(solution, graph)
+ 
+ 
+# --------------------------------------------------------------------------- #
+# Sections                                                                     #
+# --------------------------------------------------------------------------- #
+ 
+ 
+def _render_intervals(graph: BreakpointGraph) -> Iterable[str]:
+    for number, interval in enumerate(graph.amplicon_intervals, start=1):
+        yield SEPARATOR.join(
+            ["Interval", str(number), interval.chr, str(interval.start), str(interval.end)]
+        )
+ 
+ 
+def _render_segments(graph: BreakpointGraph) -> Iterable[str]:
+    for number, edge in enumerate(graph.sequence_edges, start=1):
+        yield SEPARATOR.join(
+            ["Segment", str(number), edge.chr, str(edge.start), str(edge.end)]
+        )
+ 
+ 
+def _render_constraints(
+    solution: CycleSolution, graph: BreakpointGraph
+) -> Iterable[str]:
+    """One line per maximality-filtered subpath constraint.
+ 
+    Satisfaction is taken from ``solution.satisfied_pc_set``, which the parser
+    recomputes from the extracted walks rather than reading off the model's
+    ``P`` variables -- those are only a lower bound on what a walk carries.
+    """
+    for number, constraint in enumerate(graph.longest_path_constraints, start=1):
+        origin = (
+            graph.path_constraints[constraint.pc_idx]
+            if constraint.pc_idx < len(graph.path_constraints)
+            else None
+        )
+        status = (
+            "Satisfied"
+            if constraint.pc_idx in solution.satisfied_pc_set
+            else "Unsatisfied"
+        )
+        yield SEPARATOR.join(
+            [
+                "Path constraint",
+                str(number),
+                _render_path(origin.path) if origin is not None else "",
+                f"Support={constraint.support}",
+                status,
+            ]
+        )
+ 
+ 
+def _render_walks(
+    solution: CycleSolution, graph: BreakpointGraph
+) -> Iterable[str]:
+    cycles = sorted(
+        zip(solution.walks.cycles, solution.walk_weights.cycles),
+        key=lambda pair: -pair[1],
+    )
+    paths = sorted(
+        zip(solution.walks.paths, solution.walk_weights.paths),
+        key=lambda pair: -pair[1],
+    )
+    for number, (walk, weight) in enumerate(cycles, start=1):
+        yield from _render_walk(walk, weight, graph, solution, "Cycle", number)
+    for number, (walk, weight) in enumerate(paths, start=1):
+        yield from _render_walk(walk, weight, graph, solution, "Path", number)
+ 
+ 
+def _render_walk(
+    walk: OptimizationWalk,
+    weight: float,
+    graph: BreakpointGraph,
+    solution: CycleSolution,
+    label: str,
+    number: int,
+) -> Iterable[str]:
+    """Render one walk, or several if it split into components.
+ 
+    A split only happens without connectivity enforcement. Each component is
+    reported separately rather than merged or dropped, and the suffix on the
+    number says which piece it was, so the copy number stays attributable.
+    """
+    components = traversal.eulerian_traversal(graph, walk)
+    if not components:
+        logger.warning("%s %d has no orderable segments; skipping.", label, number)
+        return
+ 
+    satisfied = sorted(
+        constraint.pc_idx + 1
+        for constraint in graph.longest_path_constraints
+        if all(
+            walk.get(edge_id, 0) >= count
+            for edge_id, count in constraint.edge_counts.items()
+        )
+    )
+    carried = ",".join(str(index) for index in satisfied)
+ 
+    for position, component in enumerate(components):
+        suffix = "" if len(components) == 1 else f".{position + 1}"
+        segments = ",".join(
+            f"{edge.idx}{edge.strand.value}" for edge in component
+        )
+        yield (
+            f"{label}={number}{suffix};"
+            f"Copy_count={weight};"
+            f"Segments={segments};"
+            f"Path_constraints_satisfied={carried}"
+        )
+ 
+ 
+def _render_path(path: list) -> str:
+    """Re-encode a subwalk as ``e2+:1,c2-:1,e3+:1``.
+ 
+    Reconstructed from the parsed walk rather than kept as the original string,
+    so what is reported is what the model was actually given.
+    """
+    pieces: list[str] = []
+    for position, element in enumerate(path):
+        if not isinstance(element, tuple) or len(element) != 2:
+            continue
+        edge_type, index = element
+        if not isinstance(edge_type, EdgeType):
+            continue
+        strand = Strand.FORWARD
+        if edge_type is EdgeType.SEQUENCE and position > 0:
+            entered = path[position - 1]
+            if getattr(entered, "strand", None) is Strand.FORWARD:
+                strand = Strand.REVERSE
+        elif edge_type is not EdgeType.SEQUENCE:
+            strand = Strand.REVERSE
+        pieces.append(f"{edge_type.value}{index + 1}{strand.value}:1")
+    return ",".join(pieces)
