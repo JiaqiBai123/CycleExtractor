@@ -1,4 +1,13 @@
-from gurobipy import Model, GRB
+try:
+    from gurobipy import Model, GRB
+except ImportError:
+    Model = None
+    GRB = None
+
+try:
+    import highspy
+except ImportError:
+    highspy = None
 import re
 import networkx as nx
 import random
@@ -13,7 +22,228 @@ import pickle
 from datetime import datetime
 import os
 import argparse
+import subprocess
 from pathlib import Path
+
+
+class HighsGRB:
+    """Small constant set used by the solver-neutral model formulations."""
+
+    BINARY = "binary"
+    INTEGER = "integer"
+    CONTINUOUS = "continuous"
+    MAXIMIZE = "maximize"
+
+
+class HighsLinearConstraint:
+    def __init__(self, expression, sense):
+        self.expression = expression
+        self.sense = sense
+
+
+class HighsLinearExpression:
+    def __init__(self, terms=None, constant=0.0):
+        self.terms = dict(terms or {})
+        self.constant = float(constant)
+
+    @staticmethod
+    def coerce(value):
+        if isinstance(value, HighsLinearExpression):
+            return value
+        if isinstance(value, HighsVariable):
+            return HighsLinearExpression({value: 1.0})
+        if isinstance(value, (int, float, np.number)):
+            return HighsLinearExpression(constant=float(value))
+        raise TypeError(f"Unsupported value in HiGHS linear expression: {type(value)!r}")
+
+    def _combine(self, other, factor):
+        other = self.coerce(other)
+        terms = dict(self.terms)
+        for variable, coefficient in other.terms.items():
+            terms[variable] = terms.get(variable, 0.0) + factor * coefficient
+            if abs(terms[variable]) < 1e-15:
+                del terms[variable]
+        return HighsLinearExpression(terms, self.constant + factor * other.constant)
+
+    def __add__(self, other):
+        return self._combine(other, 1.0)
+
+    def __radd__(self, other):
+        return self.coerce(other)._combine(self, 1.0)
+
+    def __sub__(self, other):
+        return self._combine(other, -1.0)
+
+    def __rsub__(self, other):
+        return self.coerce(other)._combine(self, -1.0)
+
+    def __mul__(self, scalar):
+        if not isinstance(scalar, (int, float, np.number)):
+            return NotImplemented
+        return HighsLinearExpression(
+            {variable: float(scalar) * coefficient for variable, coefficient in self.terms.items()},
+            float(scalar) * self.constant,
+        )
+
+    def __rmul__(self, scalar):
+        return self.__mul__(scalar)
+
+    def __neg__(self):
+        return self * -1.0
+
+    def __le__(self, other):
+        return HighsLinearConstraint(self - other, "<=")
+
+    def __ge__(self, other):
+        return HighsLinearConstraint(self - other, ">=")
+
+    def __eq__(self, other):
+        return HighsLinearConstraint(self - other, "==")
+
+
+class HighsVariable:
+    __hash__ = object.__hash__
+
+    def __init__(self, model, index, name):
+        self.model = model
+        self.index = index
+        self.name = name
+        self.X = 0.0
+
+    def _expression(self):
+        return HighsLinearExpression({self: 1.0})
+
+    def __add__(self, other):
+        return self._expression() + other
+
+    def __radd__(self, other):
+        return other + self._expression()
+
+    def __sub__(self, other):
+        return self._expression() - other
+
+    def __rsub__(self, other):
+        return other - self._expression()
+
+    def __mul__(self, scalar):
+        return self._expression() * scalar
+
+    def __rmul__(self, scalar):
+        return self.__mul__(scalar)
+
+    def __neg__(self):
+        return -self._expression()
+
+    def __le__(self, other):
+        return self._expression() <= other
+
+    def __ge__(self, other):
+        return self._expression() >= other
+
+    def __eq__(self, other):
+        return self._expression() == other
+
+
+class HighsModel:
+    """Minimal gurobipy-like facade backed directly by highspy."""
+
+    def __init__(self, name):
+        if highspy is None:
+            raise RuntimeError(
+                "The HiGHS backend requires the 'highspy' package. "
+                "Install it with: pip install highspy"
+            )
+        self.name = name
+        self._highs = highspy.Highs()
+        self._highs.cbLogging.subscribe(self._forward_highs_log)
+        self._variables = []
+        self._model_status = None
+        self.status = None
+
+    @staticmethod
+    def _forward_highs_log(event):
+        """Forward native HiGHS progress messages through CE's stdout logger."""
+        sys.stdout.write(event.message)
+        sys.stdout.flush()
+
+    def addVar(self, name, vtype=HighsGRB.CONTINUOUS, lb=0.0, ub=None):
+        index = len(self._variables)
+        upper = highspy.kHighsInf if ub is None else float(ub)
+        if vtype == HighsGRB.BINARY:
+            upper = min(upper, 1.0)
+        self._highs.addVar(float(lb), upper)
+        if vtype in (HighsGRB.BINARY, HighsGRB.INTEGER):
+            self._highs.changeColIntegrality(index, highspy.HighsVarType.kInteger)
+        variable = HighsVariable(self, index, name)
+        self._variables.append(variable)
+        try:
+            self._highs.passColName(index, name)
+        except Exception:
+            pass
+        return variable
+
+    def addVars(self, keys, vtype=HighsGRB.CONTINUOUS, lb=0.0, ub=None, name="var"):
+        keys = range(keys) if isinstance(keys, int) else list(keys)
+        return {
+            key: self.addVar(
+                name=f"{name}[{key}]",
+                vtype=vtype,
+                lb=lb,
+                ub=ub,
+            )
+            for key in keys
+        }
+
+    def setObjective(self, expression, sense):
+        expression = HighsLinearExpression.coerce(expression)
+        for variable, coefficient in expression.terms.items():
+            self._highs.changeColCost(variable.index, float(coefficient))
+        if sense == HighsGRB.MAXIMIZE:
+            self._highs.setMaximize()
+        else:
+            self._highs.setMinimize()
+
+    def addConstr(self, constraint, name=None):
+        if not isinstance(constraint, HighsLinearConstraint):
+            raise TypeError(f"Expected a linear constraint, received {type(constraint)!r}")
+        expression = constraint.expression
+        indices = np.array([v.index for v in expression.terms], dtype=np.int32)
+        values = np.array(list(expression.terms.values()), dtype=np.float64)
+        rhs = -expression.constant
+        if constraint.sense == "<=":
+            lower, upper = -highspy.kHighsInf, rhs
+        elif constraint.sense == ">=":
+            lower, upper = rhs, highspy.kHighsInf
+        else:
+            lower = upper = rhs
+        self._highs.addRow(float(lower), float(upper), len(indices), indices, values)
+
+    def setParam(self, name, value):
+        option_name = {
+            "timelimit": "time_limit",
+            "time_limit": "time_limit",
+        }.get(name.lower(), name)
+        self._highs.setOptionValue(option_name, value)
+
+    def optimize(self):
+        self._highs.run()
+        self._model_status = self._highs.getModelStatus()
+        self.status = self._model_status
+        solution = self._highs.getSolution()
+        if solution.value_valid:
+            for variable, value in zip(self._variables, solution.col_value):
+                variable.X = float(value)
+
+    def is_optimal(self):
+        return self._model_status == highspy.HighsModelStatus.kOptimal
+
+
+def optimization_model_is_optimal(model):
+    """Return True when either solver backend reports an optimal solution."""
+    if isinstance(model, HighsModel):
+        return model.is_optimal()
+    return GRB is not None and model.status == GRB.OPTIMAL
+
 ##############################
 def parse_graph_file(graph_file_path):
     segments = {}
@@ -613,27 +843,33 @@ def build_cycle_model(
                 p_discordant_edges,
                 path_constraints,
                 enforce_connectivity,
-                gamma):
-    model = Model("ILP_CoRAL_cycle")
+                gamma,
+                model_class=Model,
+                solver_api=GRB):
+    if model_class is None or solver_api is None:
+        raise RuntimeError(
+            "The Gurobi backend is unavailable. Install gurobipy or run with --solver highs."
+        )
+    model = model_class("ILP_CoRAL_cycle")
     # Decision variables   
-    X_concordant_edge = model.addVars(concordant_edges, vtype=GRB.BINARY, name="X_concordant_edge")
-    X_discordant_edge = model.addVars(discordant_edges, vtype=GRB.BINARY, name="X_discordant_edge")
-    X_sequence_edge = model.addVars(sequence_edges, vtype=GRB.BINARY, name="X_sequence_edge")   
-    f_concordant_edge = model.addVars(concordant_edges, vtype=GRB.CONTINUOUS, lb=0, name="f_concordant_edge")
-    f_discordant_edge = model.addVars(discordant_edges, vtype=GRB.CONTINUOUS, lb=0, name="f_discordant_edge")
-    f_sequence_edge = model.addVars(sequence_edges, vtype=GRB.CONTINUOUS, lb=0, name="f_sequence_edge")    
-    F = model.addVar(name="f_min", lb=0, vtype=GRB.CONTINUOUS)  
-    P = model.addVars(len(path_constraints), vtype=GRB.BINARY, name="P_path_constraint")
+    X_concordant_edge = model.addVars(concordant_edges, vtype=solver_api.BINARY, name="X_concordant_edge")
+    X_discordant_edge = model.addVars(discordant_edges, vtype=solver_api.BINARY, name="X_discordant_edge")
+    X_sequence_edge = model.addVars(sequence_edges, vtype=solver_api.BINARY, name="X_sequence_edge")   
+    f_concordant_edge = model.addVars(concordant_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_concordant_edge")
+    f_discordant_edge = model.addVars(discordant_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_discordant_edge")
+    f_sequence_edge = model.addVars(sequence_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_sequence_edge")    
+    F = model.addVar(name="f_min", lb=0, vtype=solver_api.CONTINUOUS)  
+    P = model.addVars(len(path_constraints), vtype=solver_api.BINARY, name="P_path_constraint")
     y_discordant = {}
     for i, j in discordant_edges:
         edge_key = tuple(sorted((i, j)))
         for m in range(1, K_discordant_edges[edge_key] + 1):
-            y_discordant[edge_key + (m,)] = model.addVar(name=f"y_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=GRB.BINARY)
+            y_discordant[edge_key + (m,)] = model.addVar(name=f"y_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=solver_api.BINARY)
     z_discordant = {}
     for i, j in discordant_edges:
         edge_key = tuple(sorted((i, j)))
         for m in range(1, K_discordant_edges[edge_key] + 1):
-            z_discordant[edge_key + (m,)] = model.addVar(lb=0, name=f"z_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=GRB.CONTINUOUS)
+            z_discordant[edge_key + (m,)] = model.addVar(lb=0, name=f"z_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=solver_api.CONTINUOUS)
 
     
     ### Objective function
@@ -645,7 +881,7 @@ def build_cycle_model(
    ### Objective: Maximize total flow on sequence edges weighted by length and number of path constraints satisfied
     model.setObjective(
         sum(f_sequence_edge[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges if i != 't' and j != 't')+ multiplier*sum(P[k] for k in range(len(path_constraints))),
-        GRB.MAXIMIZE
+        solver_api.MAXIMIZE
     )
     # Constraint 1: Copy number of an edge ≤ capacity × selection variable (for undirected edges)
     
@@ -750,10 +986,10 @@ def build_cycle_model(
         directed_sequence_edges = {(u, v) for u, v in sequence_edges} | {(v, u) for u, v in sequence_edges}
         directed_concordant_edges = {(u, v) for u, v in concordant_edges} | {(v, u) for u, v in concordant_edges}
         directed_discordant_edges = {(u, v) for u, v in discordant_edges} | {(v, u) for u, v in discordant_edges}
-        c_seq  = model.addVars(directed_sequence_edges,   vtype=GRB.BINARY, name="c_seq")
-        c_conc = model.addVars(directed_concordant_edges, vtype=GRB.BINARY, name="c_conc")
-        c_disc = model.addVars(directed_discordant_edges, vtype=GRB.BINARY, name="c_disc")
-        d = model.addVars(G.nodes, vtype=GRB.INTEGER, lb=0, ub=len(G.nodes), name="d")
+        c_seq  = model.addVars(directed_sequence_edges,   vtype=solver_api.BINARY, name="c_seq")
+        c_conc = model.addVars(directed_concordant_edges, vtype=solver_api.BINARY, name="c_conc")
+        c_disc = model.addVars(directed_discordant_edges, vtype=solver_api.BINARY, name="c_disc")
+        d = model.addVars(G.nodes, vtype=solver_api.INTEGER, lb=0, ub=len(G.nodes), name="d")
         
         ##### Connectivity constraints for s and t  Constraint  "s" and "t" edges and the copy number of their incident edges
         flow_out_s_discordant = sum(
@@ -942,6 +1178,15 @@ def build_cycle_model(
         "y_discordant": y_discordant,
         "z_discordant": z_discordant,
     }
+
+
+def build_cycle_model_highs(*args, **kwargs):
+    """Build the cycle MILP with the HiGHS backend."""
+    kwargs["model_class"] = HighsModel
+    kwargs["solver_api"] = HighsGRB
+    return build_cycle_model(*args, **kwargs)
+
+
 ########## Some small functions to use in the Heuristic later
 
 
@@ -1481,6 +1726,66 @@ def match_e_constraints(walk_raw, path_constraints):
             matched.append(pc["index"])
 
     return matched
+
+
+def select_best_closed_walk(
+        sequence_edges, f_sequence_edge,
+        discordant_edges, f_discordant_edge,
+        concordant_edges, f_concordant_edge,
+        segments, path_constraints, F, candidate_runs=100):
+    """Generate cycle candidates and retain the best validated path-constraint match."""
+    best_candidate = None
+    best_rank = None
+
+    for _ in range(candidate_runs):
+        all_closed_walks, construction_error = create_closed_walks(
+            sequence_edges, f_sequence_edge,
+            discordant_edges, f_discordant_edge,
+            concordant_edges, f_concordant_edge,
+            1, segments, F,
+        )
+        final_walk, not_merged_walks = merge_all_closed_walks(all_closed_walks)
+        walk_is_closed, test_message = test_closed_walk(final_walk)
+        walk_is_complete = test_merged_closed_walk(
+            final_walk,
+            sequence_edges, f_sequence_edge,
+            discordant_edges, f_discordant_edge,
+            concordant_edges, f_concordant_edge,
+            F, Path=False,
+        )
+
+        segment_string = convert_walk_to_segment_string(final_walk, segments, copy_count=F)
+        segment_list = segment_string.split("Segments=", 1)[1].split(",")
+        if segment_list == [""]:
+            segment_list = []
+        matched_constraints = set(match_e_constraints(segment_list, path_constraints))
+
+        candidate_is_valid = (
+            construction_error == 0 and walk_is_closed and walk_is_complete
+        )
+        rank = (
+            int(candidate_is_valid),
+            len(matched_constraints),
+            int(walk_is_complete),
+            int(walk_is_closed),
+            -len(not_merged_walks),
+        )
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_candidate = {
+                "all_walks": all_closed_walks,
+                "walk": final_walk,
+                "not_merged_walks": not_merged_walks,
+                "construction_error": construction_error,
+                "walk_test": walk_is_closed,
+                "test_message": test_message,
+                "completion_test": walk_is_complete,
+                "segment_string": segment_string,
+                "segments": segment_list,
+                "matched_constraints": matched_constraints,
+            }
+
+    return best_candidate
 ######## These function are parsing
 def extract_chr(pos):
     #Extract 'chrN' from a string like 'chr3:20660863+', or use full string/int otherwise.
@@ -1499,7 +1804,7 @@ def write_ILP_output(output_path,model,sequence_edges,f_sequence_edge,X_sequence
                      X_concordant_edge,discordant_edges,f_discordant_edge, X_discordant_edge,P,path_constraints):
     eps = 1e-5
     with open(output_path, "w") as f:
-        if model.status == GRB.OPTIMAL:
+        if optimization_model_is_optimal(model):
             f.write(f"Optimization took {end_time - start_time:.2f} seconds.\n")
             # Header with the new "X" column
             f.write(f"{'Edge':<15}{'Amplicon':<15}{'Start position':<20}{'End position':<20}{'X':<12}{'Flow':<10}{'Length':<12}{'K':<8}\n")
@@ -2048,27 +2353,33 @@ def build_path_model(
                 p_discordant_edges,
                 path_constraints,
                 enforce_connectivity,
-                gamma):
-    model = Model("ILP_CoRAL_cycle")
+                gamma,
+                model_class=Model,
+                solver_api=GRB):
+    if model_class is None or solver_api is None:
+        raise RuntimeError(
+            "The Gurobi backend is unavailable. Install gurobipy or run with --solver highs."
+        )
+    model = model_class("ILP_CoRAL_path")
     # Decision variables   
-    X_concordant_edge = model.addVars(concordant_edges, vtype=GRB.BINARY, name="X_concordant_edge")
-    X_discordant_edge = model.addVars(discordant_edges, vtype=GRB.BINARY, name="X_discordant_edge")
-    X_sequence_edge = model.addVars(sequence_edges, vtype=GRB.BINARY, name="X_sequence_edge")   
-    f_concordant_edge = model.addVars(concordant_edges, vtype=GRB.CONTINUOUS, lb=0, name="f_concordant_edge")
-    f_discordant_edge = model.addVars(discordant_edges, vtype=GRB.CONTINUOUS, lb=0, name="f_discordant_edge")
-    f_sequence_edge = model.addVars(sequence_edges, vtype=GRB.CONTINUOUS, lb=0, name="f_sequence_edge")    
-    F = model.addVar(name="f_min", lb=0, vtype=GRB.CONTINUOUS)  
-    P = model.addVars(len(path_constraints), vtype=GRB.BINARY, name="P_path_constraint")
+    X_concordant_edge = model.addVars(concordant_edges, vtype=solver_api.BINARY, name="X_concordant_edge")
+    X_discordant_edge = model.addVars(discordant_edges, vtype=solver_api.BINARY, name="X_discordant_edge")
+    X_sequence_edge = model.addVars(sequence_edges, vtype=solver_api.BINARY, name="X_sequence_edge")   
+    f_concordant_edge = model.addVars(concordant_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_concordant_edge")
+    f_discordant_edge = model.addVars(discordant_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_discordant_edge")
+    f_sequence_edge = model.addVars(sequence_edges, vtype=solver_api.CONTINUOUS, lb=0, name="f_sequence_edge")    
+    F = model.addVar(name="f_min", lb=0, vtype=solver_api.CONTINUOUS)  
+    P = model.addVars(len(path_constraints), vtype=solver_api.BINARY, name="P_path_constraint")
     y_discordant = {}
     for i, j in discordant_edges:
         edge_key = tuple(sorted((i, j)))
         for m in range(1, K_discordant_edges[edge_key] + 1):
-            y_discordant[edge_key + (m,)] = model.addVar(name=f"y_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=GRB.BINARY)
+            y_discordant[edge_key + (m,)] = model.addVar(name=f"y_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=solver_api.BINARY)
     z_discordant = {}
     for i, j in discordant_edges:
         edge_key = tuple(sorted((i, j)))
         for m in range(1, K_discordant_edges[edge_key] + 1):
-            z_discordant[edge_key + (m,)] = model.addVar(lb=0, name=f"z_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=GRB.CONTINUOUS)
+            z_discordant[edge_key + (m,)] = model.addVar(lb=0, name=f"z_discordant_{edge_key[0]}_{edge_key[1]}_{m}", vtype=solver_api.CONTINUOUS)
 
     
     ### Objective function
@@ -2080,7 +2391,7 @@ def build_path_model(
    ### Objective: Maximize total flow on sequence edges weighted by length and number of path constraints satisfied
     model.setObjective(
         sum(f_sequence_edge[tuple(sorted((i, j)))] * length_sequence_edges[tuple(sorted((i, j)))] for (i, j) in sequence_edges)+ multiplier*sum(P[k] for k in range(len(path_constraints))),
-        GRB.MAXIMIZE
+        solver_api.MAXIMIZE
     )
     # Constraint 1: Copy number of an edge ≤ capacity × selection variable (for undirected edges)
     
@@ -2222,10 +2533,10 @@ def build_path_model(
         directed_sequence_edges = {(u, v) for u, v in sequence_edges} | {(v, u) for u, v in sequence_edges}
         directed_concordant_edges = {(u, v) for u, v in concordant_edges} | {(v, u) for u, v in concordant_edges}
         directed_discordant_edges = {(u, v) for u, v in discordant_edges} | {(v, u) for u, v in discordant_edges}
-        c_seq  = model.addVars(directed_sequence_edges,   vtype=GRB.BINARY, name="c_seq")
-        c_conc = model.addVars(directed_concordant_edges, vtype=GRB.BINARY, name="c_conc")
-        c_disc = model.addVars(directed_discordant_edges, vtype=GRB.BINARY, name="c_disc")
-        d = model.addVars(G.nodes, vtype=GRB.INTEGER, lb=0, ub=len(G.nodes), name="d")
+        c_seq  = model.addVars(directed_sequence_edges,   vtype=solver_api.BINARY, name="c_seq")
+        c_conc = model.addVars(directed_concordant_edges, vtype=solver_api.BINARY, name="c_conc")
+        c_disc = model.addVars(directed_discordant_edges, vtype=solver_api.BINARY, name="c_disc")
+        d = model.addVars(G.nodes, vtype=solver_api.INTEGER, lb=0, ub=len(G.nodes), name="d")
         
     
         
@@ -2370,6 +2681,13 @@ def build_path_model(
         "y_discordant": y_discordant,
         "z_discordant": z_discordant,
     }
+def build_path_model_highs(*args, **kwargs):
+    """Build the path MILP with the HiGHS backend."""
+    kwargs["model_class"] = HighsModel
+    kwargs["solver_api"] = HighsGRB
+    return build_path_model(*args, **kwargs)
+
+
 ########## Heuristic to create paths
 def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discordant_edge, 
                      concordant_edges, f_concordant_edge,max_attempts,segments, F):
@@ -2416,10 +2734,13 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
     current_node = 's'
     
     # Start with a discordant edge from s
-    start_edge = next(
-        e for e in sorted(remaining_discordant_edges, key=edge_segment_rank)
+    start_candidates = [
+        e for e in remaining_discordant_edges.elements()
         if 's' in e
-    )
+    ]
+    if not start_candidates:
+        return [[]], 1
+    start_edge = random.choice(start_candidates)
     use_edge(remaining_discordant_edges, start_edge)
     first_walk_edges.append(("node", current_node))
     first_walk_edges.append(("discordant edge", start_edge))
@@ -2430,7 +2751,11 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
     
     while True:
         if edge_type == "sequence":
-            match = next((e for e in sorted(remaining_sequence_edges, key=edge_segment_rank) if current_node in e), None)
+            candidates = [
+                e for e in remaining_sequence_edges.elements()
+                if current_node in e
+            ]
+            match = random.choice(candidates) if candidates else None
             if not match:
                 break
             use_edge(remaining_sequence_edges, match)
@@ -2441,12 +2766,20 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
             edge_type = "non-sequence"
     
         elif edge_type == "non-sequence":
-            match = next((e for e in sorted(remaining_discordant_edges, key=edge_segment_rank) if current_node in e), None)
-            if match is None:
-                match = next((e for e in sorted(remaining_concordant_edges, key=edge_segment_rank) if current_node in e), None)
+            candidates = [
+                ("discordant edge", e)
+                for e in remaining_discordant_edges.elements()
+                if current_node in e
+            ] + [
+                ("concordant edge", e)
+                for e in remaining_concordant_edges.elements()
+                if current_node in e
+            ]
+            selected = random.choice(candidates) if candidates else None
+            match = selected[1] if selected else None
             if not match:
                 break
-            edge_label = "discordant edge" if match in remaining_discordant_edges else "concordant edge"
+            edge_label = selected[0]
             use_edge(remaining_discordant_edges if edge_label == "discordant edge" else remaining_concordant_edges, match)
             next_node = match[1] if match[0] == current_node else match[0]
             first_walk_edges.append((edge_label, match))
@@ -2471,13 +2804,80 @@ def create_s_t_walks(sequence_edges, f_sequence_edge, discordant_edges, f_discor
                              remaining_concordant_edges, f_concordant_edge, max_attempts,segments, F)
         s_t_Walk.extend(Closed_Walks_Of_Path)
         
-        for walk in s_t_Walk[1:]:   # skip the first one which is s-t path and is not close
-            if any(not test_closed_walk(walk) for walk in Closed_Walks_Of_Path[1:]):
-                error_in_closed_walks = 1
-            else:
-                error_in_closed_walks = 0
+        if error_in_closed_walks_of_path == 1 or any(
+                not test_closed_walk(walk)[0]
+                for walk in Closed_Walks_Of_Path):
+            error_in_closed_walks = 1
         
     return s_t_Walk, error_in_closed_walks
+
+
+def select_best_s_t_walk(
+        sequence_edges, f_sequence_edge,
+        discordant_edges, f_discordant_edge,
+        concordant_edges, f_concordant_edge,
+        segments, path_constraints, F, candidate_runs=100):
+    """Generate s-t candidates and retain the best validated path-constraint match."""
+    best_candidate = None
+    best_rank = None
+
+    for _ in range(candidate_runs):
+        s_t_walks, construction_error = create_s_t_walks(
+            sequence_edges, f_sequence_edge,
+            discordant_edges, f_discordant_edge,
+            concordant_edges, f_concordant_edge,
+            1, segments, F,
+        )
+        primary_walk = s_t_walks[0] if s_t_walks else []
+        merged_walk, not_merged_walks = merge_all_closed_walks(s_t_walks)
+        walk_is_complete = test_merged_closed_walk(
+            primary_walk,
+            sequence_edges, f_sequence_edge,
+            discordant_edges, f_discordant_edge,
+            concordant_edges, f_concordant_edge,
+            F, Path=True,
+        )
+        has_s_t_endpoints = (
+            bool(primary_walk)
+            and primary_walk[0] == ("node", "s")
+            and primary_walk[-1] == ("node", "t")
+            and is_edge_type_alternating(primary_walk)
+        )
+
+        segment_string = convert_s_t_walk_to_segment_string(
+            primary_walk[2:-2], segments, copy_count=F
+        )
+        segment_list = segment_string.split("Segments=", 1)[1].split(",")
+        if segment_list == [""]:
+            segment_list = []
+        matched_constraints = set(match_e_constraints(segment_list, path_constraints))
+
+        candidate_is_valid = (
+            construction_error == 0 and has_s_t_endpoints and walk_is_complete
+        )
+        rank = (
+            int(candidate_is_valid),
+            len(matched_constraints),
+            int(walk_is_complete),
+            int(has_s_t_endpoints),
+            -len(not_merged_walks),
+        )
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best_candidate = {
+                "walks": s_t_walks,
+                "walk": primary_walk,
+                "merged_walk": merged_walk,
+                "not_merged_walks": not_merged_walks,
+                "construction_error": construction_error,
+                "endpoint_test": has_s_t_endpoints,
+                "completion_test": walk_is_complete,
+                "segment_string": segment_string,
+                "segments": segment_list,
+                "matched_constraints": matched_constraints,
+            }
+
+    return best_candidate
 
 ############# convert s-t walk to segment string
 def convert_s_t_walk_to_segment_string(walk, segments, copy_count):
@@ -2701,6 +3101,56 @@ def write_all_cycles_and_paths(segments, new_output_file, all_cycles_ordered, al
                 f"Segments={seg_str};"
                 f"Path_constraints_satisfied={path_str}\n"
             )
+
+
+def export_cycles_to_fasta(cycles_file, reference_file, fasta_output, converter_script):
+    """Run ecSimulator's cycles_file_to_fasta.py on a completed cycles file."""
+    cycles_file = Path(cycles_file).resolve()
+    reference_file = Path(reference_file).expanduser().resolve()
+    fasta_output = Path(fasta_output).expanduser().resolve()
+    converter_script = Path(converter_script).expanduser().resolve()
+
+    if not cycles_file.is_file():
+        raise FileNotFoundError(f"Cycles file was not created: {cycles_file}")
+    if not reference_file.is_file():
+        raise FileNotFoundError(f"Reference FASTA does not exist: {reference_file}")
+    if not converter_script.is_file():
+        raise FileNotFoundError(
+            "cycles_file_to_fasta.py was not found at "
+            f"{converter_script}. Use --cycles-to-fasta-script to specify its location."
+        )
+
+    fasta_output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(converter_script),
+        "--cycles",
+        str(cycles_file),
+        "--ref",
+        str(reference_file),
+        "--out",
+        str(fasta_output),
+    ]
+
+    print("Generating FASTA file:")
+    print("  " + " ".join(command))
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.returncode != 0:
+        raise RuntimeError(
+            "cycles_file_to_fasta.py failed with exit code "
+            f"{result.returncode}. See the converter output above."
+        )
+    print(f"FASTA export completed: {fasta_output}")
+
+
 #####################################################################
 ################## The code starts here #############################
 #####################################################################
@@ -2717,34 +3167,82 @@ delta_F=0
 # -----------------------------------------
 # Parse command-line arguments
 # -----------------------------------------
-parser = argparse.ArgumentParser(description="Run Circular Element ILP Solver.")
-parser.add_argument("--graph", required=True, help="Path to input graph file")
+parser = argparse.ArgumentParser(description="Run Cycle Extractor ILP Solver.")
+parser.add_argument("--graph", required=True, help="Path to input graph file.")
+parser.add_argument("--output", required=True, help="Path to output cycles file.")
+parser.add_argument("--log_file", help="Optional, path to log file.")
 parser.add_argument("--enforce-connectivity",action="store_true",help="Enable connectivity-enforced ILP (default = off)")
 parser.add_argument("--gamma",type=float,default=0.01,help="Gamma value (default = 0.01)")
 parser.add_argument("--version",action="version",version=f"CE version {__version__}",help="Print version and exit")
 parser.add_argument("--sort-by",choices=["CopyNumber", "LWCN"],default="CopyNumber",help="How to sort cycles/paths: CopyNumber (default) or LWCN")
 parser.add_argument("--s-t-strategy",choices=["all_nodes", "intervals"],default="all_nodes",help="s/t connection strategy: 'all_nodes' (default) or 'intervals' (only interval start/end)")
+parser.add_argument(
+    "--solver",
+    choices=["gurobi", "highs"],
+    default="gurobi",
+    help="MILP solver backend (default: gurobi).",
+)
+parser.add_argument(
+    "--fasta-output",
+    help=(
+        "Optional FASTA output path. When provided, CE converts the generated "
+        "cycles file to FASTA after cycle extraction."
+    ),
+)
+parser.add_argument(
+    "--ref",
+    help="Reference-genome FASTA required when --fasta-output is used.",
+)
+parser.add_argument(
+    "--cycles-to-fasta-script",
+    default="~/ecSimulator/src/cycles_file_to_fasta.py",
+    help=(
+        "Path to ecSimulator's cycles_file_to_fasta.py "
+        "(default: ~/ecSimulator/src/cycles_file_to_fasta.py)."
+    ),
+)
 args = parser.parse_args()
+
+if bool(args.fasta_output) != bool(args.ref):
+    parser.error("--fasta-output and --ref must be provided together.")
+if args.solver == "gurobi" and (Model is None or GRB is None):
+    parser.error(
+        "The Gurobi backend is unavailable because gurobipy is not installed. "
+        "Install gurobipy or use --solver highs."
+    )
+if args.solver == "highs" and highspy is None:
+    parser.error(
+        "The HiGHS backend is unavailable because highspy is not installed. "
+        "Install it with: pip install highspy"
+    )
+
+cycle_model_builder = build_cycle_model if args.solver == "gurobi" else build_cycle_model_highs
+path_model_builder = build_path_model if args.solver == "gurobi" else build_path_model_highs
 
 # -----------------------------------------
 # Resolve paths
 # -----------------------------------------
 graph_file_path = Path(args.graph).resolve()
-test_dir = graph_file_path.parent   # directory containing the graph
-ilp_test_dir = test_dir
+#cycles_file_path = Path(args.output).resolve()
+#output_dir = cycles_file_path.parent   # directory containing the graph
+output_file = Path(args.output).resolve()
+output_dir = output_file.parent
+output_dir.mkdir(parents=True, exist_ok=True)
+
 ENFORCE_CONNECTIVITY = args.enforce_connectivity  # <--- HERE
 print(f"Using graph file: {graph_file_path}")
-print(f"Test/output directory: {test_dir}")
+print(f"Test/output directory: {output_dir}")
 
 #gamma=0.01
 gamma = args.gamma
 print(f"Gamma value set to: {gamma}")
 print(f"CE version: {__version__}")
+print(f"MILP solver: {args.solver}")
 # if args.version:
 #     print(f"CE version {__version__}")
 #     sys.exit(0)
 
-ilp_test_dir=test_dir
+#ilp_test_dir=test_dir
 
 
 #ILP_cycle_file_path = ilp_test_dir/"ILP_cycles_Not_Ordered.txt"
@@ -2755,14 +3253,13 @@ amplicon_name = amplicon_file_name.replace("_graph.txt", "")  # e.g., "amplicon1
 # Extract amplicon number using regex
 # match = re.search(r"amplicon(\d+)", amplicon_name.lower())
 # amplicon_num = match.group(1) # e.g., "1"
+
 if ENFORCE_CONNECTIVITY:
-    Cycles_file_path = ilp_test_dir / "ILP_Connectivity_cycles.txt"
+    log_file = output_dir / "ILP_Connectivity_log.txt"
 else:
-    Cycles_file_path = ilp_test_dir / "ILP_cycles.txt"
-if ENFORCE_CONNECTIVITY:
-    log_file = test_dir / "ILP_Connectivity_log.txt"
-else:
-    log_file = test_dir / "ILP_log.txt"
+    log_file = output_dir / "ILP_log.txt"
+if args.log_file:
+    log_file = args.log_file
 
 # Redirect stdout to both console and file
 class Logger:
@@ -2776,7 +3273,7 @@ class Logger:
         while "\n" in self.buffer:
             line, self.buffer = self.buffer.split("\n", 1)
             if line.strip():
-                timestamp = datetime.now().strftime("[%H:%M:%S.%f ]  ")[:-3]
+                timestamp = datetime.now().strftime("[%H:%M:%S.%f] ")
                 self.log.write(f"{timestamp}{line}\n")
                 self.terminal.write(f"{line}\n")
             else:
@@ -2793,18 +3290,32 @@ class Logger:
 # Open file in write mode (overwrite) or append mode ('a')
 sys.stdout = Logger(log_file)
 ####################### 
-test_name = test_dir.name
 
-ilp_test_dir.mkdir(exist_ok=True)  # Create test* subdir in ILP if needed 
+#ilp_test_dir.mkdir(exist_ok=True)  # Create test* subdir in ILP if needed 
+#test_dir.mkdir(exist_ok=True)  # Create test* subdir in ILP if needed 
 print(f"CE version: {__version__}")
 print(f"Gamma value set to: {gamma}")
+print(f"MILP solver: {args.solver}")
+print(f"Cycle sorting method: {args.sort_by}")
+print(f"Source/sink connection strategy: {args.s_t_strategy}")
 print(f"Using graph file: {graph_file_path}")
-print(f"Test/output directory: {test_dir}")
+print(f"Test/output directory: {output_file}")
+if args.fasta_output:
+    print("FASTA export: enabled")
+    print(f"FASTA output file: {Path(args.fasta_output).expanduser().resolve()}")
+    print(f"Reference genome: {Path(args.ref).expanduser().resolve()}")
+    print(
+        "Cycles-to-FASTA script: "
+        f"{Path(args.cycles_to_fasta_script).expanduser().resolve()}"
+    )
+else:
+    print("FASTA export: disabled")
 
 #gamma=0.01
 gamma = args.gamma
 
 
+#ilp_test_dir.mkdir(exist_ok=True)  # Create test* subdir in ILP if needed 
 if ENFORCE_CONNECTIVITY:
     print("Connectivity is enforced.")
 else:
@@ -2854,7 +3365,7 @@ while True: #while Iteration==1:
     ###################################################
     
     ####### Cycle solution
-    ILP_Cycle_model, variables= build_cycle_model(
+    ILP_Cycle_model, variables = cycle_model_builder(
                     G,
                     nodes,
                     concordant_edges,
@@ -2899,7 +3410,7 @@ while True: #while Iteration==1:
     F_val = float(F.X)
     P_val = {k: float(v.X) for k, v in P.items()}
     
-    if ILP_Cycle_model.status != GRB.OPTIMAL  or   total_solution_weight > 0.9*weight_graph or F_val<1 :
+    if not optimization_model_is_optimal(ILP_Cycle_model) or total_solution_weight > 0.9*weight_graph or F_val<1:
         
         Num_cycles=Cycle_Or_Path_Number-1
         break
@@ -2913,13 +3424,24 @@ while True: #while Iteration==1:
     #                  X_concordant_edge_val,discordant_edges,f_discordant_edge_val, X_discordant_edge_val,P_val,path_constraints)                                                       
 
     segments, Path_Constraints = parse_graph_file(graph_file_path)
-    all_closed_walks, error_in_closed_walks = create_closed_walks(sequence_edges, f_sequence_edge_val, discordant_edges, f_discordant_edge_val, 
-                             concordant_edges, f_concordant_edge_val,max_random_search_heuristic_attempts,segments, F_val)
-    Final_closed_walk, not_merged_walks = merge_all_closed_walks(all_closed_walks)
-    Final_closed_walk_test, test_message = test_closed_walk(Final_closed_walk)
-    Final_closed_walk_completion_test = test_merged_closed_walk(Final_closed_walk, sequence_edges, f_sequence_edge_val,
-               discordant_edges, f_discordant_edge_val,
-               concordant_edges, f_concordant_edge_val, F_val,Path=False)
+    best_cycle_candidate = select_best_closed_walk(
+        sequence_edges, f_sequence_edge_val,
+        discordant_edges, f_discordant_edge_val,
+        concordant_edges, f_concordant_edge_val,
+        segments, Path_Constraints, F_val,
+        candidate_runs=max_random_search_heuristic_attempts,
+    )
+    print(
+        f"Selected the best of {max_random_search_heuristic_attempts} cycle-walk candidates; "
+        f"matched {len(best_cycle_candidate['matched_constraints'])} path constraints."
+    )
+    all_closed_walks = best_cycle_candidate["all_walks"]
+    Final_closed_walk = best_cycle_candidate["walk"]
+    not_merged_walks = best_cycle_candidate["not_merged_walks"]
+    error_in_closed_walks = best_cycle_candidate["construction_error"]
+    Final_closed_walk_test = best_cycle_candidate["walk_test"]
+    test_message = best_cycle_candidate["test_message"]
+    Final_closed_walk_completion_test = best_cycle_candidate["completion_test"]
     delta_F=0
     if not Final_closed_walk_completion_test:
         delta_F=Increase_CN(Final_closed_walk, F_val, capacity_sequence_edges, capacity_concordant_edges, capacity_discordant_edges)
@@ -2961,8 +3483,7 @@ while True: #while Iteration==1:
     Final_Closed_Walk_segments = final_segment_str.split("Segments=")[1].split(',')
     print(f"Finish extracting cycle {Cycle_Or_Path_Number}")
     print("Metric Calculation and Print files")
-    matched_pcs = match_e_constraints(Final_Closed_Walk_segments, Path_Constraints)
-    matched_index_set = set(matched_pcs)
+    matched_index_set = set(best_cycle_candidate["matched_constraints"])
     # write_ILP_cycle_file(segments, ILP_cycle_file_path,final_segment_str, Cycle_Or_Path_Number,
     #                          Final_Closed_Walk_segments, Final_closed_walk_test, Final_closed_walk_completion_test, error_in_closed_walks,
     #                          Path_Constraints, matched_index_set,max_random_search_heuristic_attempts)
@@ -3142,7 +3663,7 @@ print("Start path extraction")
 start=time.time()
 delta_F=0
 while True: # while Iteration==1:
-    ILP_Path_model, variables= build_path_model(
+    ILP_Path_model, variables = path_model_builder(
                     G,
                     nodes,
                     concordant_edges,
@@ -3187,7 +3708,7 @@ while True: # while Iteration==1:
     F_val = float(F.X)
     P_val = {k: float(v.X) for k, v in P.items()}
     
-    if ILP_Path_model.status != GRB.OPTIMAL or total_solution_weight > 0.9*weight_graph or F_val<1 :
+    if not optimization_model_is_optimal(ILP_Path_model) or total_solution_weight > 0.9*weight_graph or F_val<1:
         Num_paths=Cycle_Or_Path_Number-Num_cycles-1
         break
     max_random_search_heuristic_attempts = 100       
@@ -3200,21 +3721,28 @@ while True: # while Iteration==1:
     #                  X_concordant_edge_val,discordant_edges,f_discordant_edge_val, X_discordant_edge_val,P_val,path_constraints)                                                       
     
     segments, Path_Constraints = parse_graph_file(graph_file_path)
-    s_t_Walk, error_in_closed_walks = create_s_t_walks(sequence_edges, f_sequence_edge_val, discordant_edges, f_discordant_edge_val, 
-                         concordant_edges, f_concordant_edge_val,max_random_search_heuristic_attempts,segments, F_val)
-
-    merged_s_t_walk, not_merged_closed_walks_to_s_t_path = merge_all_closed_walks(s_t_Walk)
-    final_segment_str = convert_s_t_walk_to_segment_string(s_t_Walk[0][2:-2], segments, copy_count=F_val)
+    best_path_candidate = select_best_s_t_walk(
+        sequence_edges, f_sequence_edge_val,
+        discordant_edges, f_discordant_edge_val,
+        concordant_edges, f_concordant_edge_val,
+        segments, Path_Constraints, F_val,
+        candidate_runs=max_random_search_heuristic_attempts,
+    )
+    print(
+        f"Selected the best of {max_random_search_heuristic_attempts} s-t-walk candidates; "
+        f"matched {len(best_path_candidate['matched_constraints'])} path constraints."
+    )
+    s_t_Walk = best_path_candidate["walks"]
+    error_in_closed_walks = best_path_candidate["construction_error"]
+    merged_s_t_walk = best_path_candidate["merged_walk"]
+    not_merged_closed_walks_to_s_t_path = best_path_candidate["not_merged_walks"]
+    final_segment_str = best_path_candidate["segment_string"]
     final_segment_str = re.sub(r"Path=\d+", f"Path={Cycle_Or_Path_Number}", final_segment_str)
     parts = final_segment_str.split(';', 1)  # split at first semicolon
-    Final_s_t_Walk = final_segment_str.split("Segments=")[1].split(',')
-    Final_s_t_Walk_segments = final_segment_str.split("Segments=")[1].split(',')
-    #matched_index_set = set()
-    matched_pcs = match_e_constraints(Final_s_t_Walk_segments, Path_Constraints)
-    matched_index_set = set(matched_pcs)
-    Final_s_t_walk_completion_test = test_merged_closed_walk(s_t_Walk[0], sequence_edges, f_sequence_edge_val,
-               discordant_edges, f_discordant_edge_val,
-               concordant_edges, f_concordant_edge_val, F_val,Path=True)
+    Final_s_t_Walk_segments = list(best_path_candidate["segments"])
+    Final_s_t_Walk = Final_s_t_Walk_segments
+    matched_index_set = set(best_path_candidate["matched_constraints"])
+    Final_s_t_walk_completion_test = best_path_candidate["completion_test"]
     F_val -= delta_F
     delta_F=0
     if not Final_s_t_walk_completion_test:
@@ -3421,6 +3949,16 @@ for item in Disconnected_Solutions:
                 item["New_Order_Of_Path_Number"] = path["New_Order_Of_Path_Number"]
                 break
             
-write_all_cycles_and_paths(segments, Cycles_file_path, All_Cycles_Ordered, All_Paths_Ordered, Path_Constraints)
+#write_all_cycles_and_paths(segments, cycles_file_path, All_Cycles_Ordered, All_Paths_Ordered, Path_Constraints)
+
+write_all_cycles_and_paths(segments, output_file, All_Cycles_Ordered, All_Paths_Ordered, Path_Constraints)
+
+if args.fasta_output:
+    export_cycles_to_fasta(
+        cycles_file=output_file,
+        reference_file=args.ref,
+        fasta_output=args.fasta_output,
+        converter_script=args.cycles_to_fasta_script,
+    )
     
     
