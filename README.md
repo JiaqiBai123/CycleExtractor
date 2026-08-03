@@ -141,8 +141,8 @@ A GRCh38 (hg38) reference genome FASTA is required for FASTA generation. If it i
 |`--version`|	Print CE version and exit.|	-
 |`--fasta-output`|	Path to the output file where the fasta cycles file will be written.|	-
 |`--ref`|	Path to the hg38. Required only when --fasta-output is used.|	-
-|`--cycles-to-fasta-script`|	Path to the cycles_file_to_fasta.py
-Script from the ecSimulator project.|	~/ecSimulator/src/cycles_file_to_fasta.py
+|`--cycles-to-fasta-script`|	Path to the cycles_file_to_fasta.py Script from the ecSimulator project.|	~/ecSimulator/src/cycles_file_to_fasta.py
+|`--solver`|	highs.|	gurobi
 
 # Starting from bam files
 
