@@ -10,7 +10,7 @@ If you use CE in your research, please cite:
 - **Gurobi Optimizer** — a free academic license is available [here](https://www.gurobi.com/). The ```gurobipy``` package is installed automatically when you install Gurobi.
 - **HiGHS (optional)** — an open-source MILP solver. To use HiGHS, install the Python interface:
 ```bash
-pip install highspy
+- pip install highspy
 
 - Python packages:
   - numpy
