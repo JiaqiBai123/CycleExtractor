@@ -116,6 +116,15 @@ List of extracted cycles/paths
 Cycle=1;Copy_count=85.18981770204846;Segments=2+,4+,6+;Path_constraints_satisfied=
 ```
 
+# Optional Output
+CE optionally generates FASTA sequences for reconstructed cycles using the cycles_file_to_fasta.py utility from the AmpliconSuite ecSimulator project. Users should clone the ecSimulator repository
+
+https://github.com/AmpliconSuite/ecSimulator/blob/master/src/cycles_file_to_fasta.py
+
+By default, CE searches for ~/ecSimulator/src/cycles_file_to_fasta.py. If ecSimulator is installed elsewhere, the script location can be specified with --cycles-to-fasta-script.
+A GRCh38 (hg38) reference genome FASTA is required for FASTA generation. If it is not already available, it can be downloaded from major genomic resources, including the NCBI Assembly, UCSC Genome Browser, or GENCODE.
+
+
 # Command-Line Options
 |Option|Description|Default|
 | ------------- | ------------- |------------- |
@@ -126,6 +135,10 @@ Cycle=1;Copy_count=85.18981770204846;Segments=2+,4+,6+;Path_constraints_satisfie
 |`--s-t-strategy <all_nodes\|intervals>`| Choose whether to connect source/sink nodes to all nodes or only to interval start/end nodes.	| `all_nodes`
 |`--enforce-connectivity`|	CEc mode, which outputs a single connected cycle/s,t-walk at each iteration. CE simply returns the cycle (or walk) with maximum CN when multiple disjoint cycles are produced due to the lack of connectivity constraints, making it potentially faster than CEc. |	off
 |`--version`|	Print CE version and exit.|	-
+|`--fasta-output`|	Path to the output file where the fasta cycles file will be written.|	-
+|`--ref`|	Path to the hg38. Required only when --fasta-output is used.|	-
+|`--cycles-to-fasta-script`|	Path to the cycles_file_to_fasta.py
+Script from the ecSimulator project.|	~/ecSimulator/src/cycles_file_to_fasta.py
 
 # Starting from bam files
 
